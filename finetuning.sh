@@ -51,6 +51,7 @@ if [ "$GPU_COUNT" -le 0 ]; then
 fi
 
 echo "Detected GPUs: $GPU_COUNT"
+NPROC_PER_NODE=${NPROC_PER_NODE:-4}
 if [ "$GPU_COUNT" -lt "$NPROC_PER_NODE" ]; then
     echo "Warning: NPROC_PER_NODE ($NPROC_PER_NODE) > available GPUs ($GPU_COUNT)"
     echo "Auto-adjust NPROC_PER_NODE to available GPUs"
