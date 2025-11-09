@@ -27,6 +27,7 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
@@ -111,11 +112,15 @@ class FinetuneConfig:
                                                      #         False and merge final checkpoint offline!
 
     # Logging
+    use_wandb: bool = False                          # If True, uses WandB for logging
+    use_tensorboard: bool = True                     # If True, uses TensorBoard for logging
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
     wandb_project: str = "your-wandb-project"        # Name of WandB project
+    wandb_mode: str = "online"                       # WandB mode: "online", "offline", or "disabled"
+    tensorboard_log_dir: Optional[str] = None        # TensorBoard log directory (default: run_root_dir/run_id/tensorboard)
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
-    wandb_log_freq: int = 10                         # WandB logging frequency in steps
+    log_freq: int = 10                               # Logging frequency in steps (for both WandB and TensorBoard)
 
     # fmt: on
 
@@ -571,6 +576,49 @@ def log_metrics_to_wandb(metrics, prefix, step, wandb_entity) -> None:
     wandb_entity.log(log_dict, step=step)
 
 
+def log_metrics_to_tensorboard(metrics, prefix, step, tensorboard_writer) -> None:
+    """
+    Log metrics to TensorBoard.
+
+    Args:
+        metrics (dict): Dictionary of metrics to log
+        prefix (str): Prefix for metric names
+        step (int): Training step
+        tensorboard_writer (SummaryWriter): TensorBoard SummaryWriter instance
+
+    Returns:
+        None.
+    """
+    for name, value in metrics.items():
+        # Map loss_value to Loss for better readability
+        if name == "loss_value":
+            tensorboard_writer.add_scalar(f"{prefix}/Loss", value, step)
+        else:
+            # Convert metric name to readable format
+            metric_name = name.replace('_', ' ').title().replace(' ', '_')
+            tensorboard_writer.add_scalar(f"{prefix}/{metric_name}", value, step)
+
+
+def log_metrics(metrics, prefix, step, wandb_entity=None, tensorboard_writer=None) -> None:
+    """
+    Log metrics to WandB and/or TensorBoard.
+
+    Args:
+        metrics (dict): Dictionary of metrics to log
+        prefix (str): Prefix for metric names
+        step (int): Training step
+        wandb_entity: Optional WandB entity instance
+        tensorboard_writer: Optional TensorBoard SummaryWriter instance
+
+    Returns:
+        None.
+    """
+    if wandb_entity is not None:
+        log_metrics_to_wandb(metrics, prefix, step, wandb_entity)
+    if tensorboard_writer is not None:
+        log_metrics_to_tensorboard(metrics, prefix, step, tensorboard_writer)
+
+
 def save_training_checkpoint(
     cfg,
     run_dir,
@@ -678,6 +726,8 @@ def run_validation(
     log_step,
     distributed_state,
     val_time_limit,
+    wandb_entity=None,
+    tensorboard_writer=None,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -745,9 +795,9 @@ def run_validation(
     # Add batch count to metrics
     avg_val_metrics["val_batches_count"] = val_batches_count
 
-    # Log validation metrics to W&B
+    # Log validation metrics
     if distributed_state.is_main_process:
-        log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
+        log_metrics(avg_val_metrics, "VLA Val", log_step, wandb_entity, tensorboard_writer)
 
 
 @draccus.wrap()
@@ -766,10 +816,17 @@ def finetune(cfg: FinetuneConfig) -> None:
     Returns:
         None.
     """
-    assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
+    # Note: Full parameter fine-tuning is supported but requires significantly more memory
+    # and may need smaller learning rate. LoRA is recommended for most use cases.
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
+    if not cfg.use_lora:
+        print("WARNING: Full parameter fine-tuning is enabled. This requires:")
+        print("  - Significantly more GPU memory (may need to reduce batch_size)")
+        print("  - More training time")
+        print("  - Consider using a smaller learning rate (e.g., 1e-5 to 5e-5)")
+        print("  - LoRA is recommended for most use cases (--use_lora=True)")
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
@@ -788,9 +845,38 @@ def finetune(cfg: FinetuneConfig) -> None:
     torch.cuda.set_device(device_id)
     torch.cuda.empty_cache()
 
-    # Initialize wandb logging
+    # Initialize logging
+    wandb_entity = None
+    tensorboard_writer = None
+    tensorboard_log_dir = None
+    wandb_run_dir = None
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
+        if cfg.use_wandb:
+            wandb_init_kwargs = {
+                "entity": cfg.wandb_entity,
+                "project": cfg.wandb_project,
+                "name": f"ft+{run_id}",
+                "mode": cfg.wandb_mode,
+            }
+            # In offline mode, WandB saves logs to wandb/ directory in the current working directory
+            # We can optionally set dir to save logs in the run directory
+            if cfg.wandb_mode == "offline":
+                wandb_run_dir = run_dir / "wandb"
+                wandb_init_kwargs["dir"] = str(wandb_run_dir)
+                print(f"WandB offline mode: logs will be saved to {wandb_run_dir}")
+                print(f"To sync logs later, run: wandb sync {wandb_run_dir}")
+            
+            wandb.init(**wandb_init_kwargs)
+            wandb_entity = wandb
+        if cfg.use_tensorboard:
+            if cfg.tensorboard_log_dir is None:
+                tensorboard_log_dir = run_dir / "tensorboard"
+            else:
+                tensorboard_log_dir = Path(cfg.tensorboard_log_dir)
+            tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
+            tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
+            print(f"TensorBoard logs will be saved to: {tensorboard_log_dir}")
+            print(f"To view logs, run: tensorboard --logdir {tensorboard_log_dir}")
 
     # Print detected constants
     print(
@@ -842,7 +928,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
-    # LoRA setup
+    # LoRA setup (optional)
     if cfg.use_lora:
         lora_config = LoraConfig(
             r=cfg.lora_rank,
@@ -853,23 +939,43 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
+    else:
+        # Full parameter fine-tuning: enable gradients for all parameters
+        print("Full parameter fine-tuning: training all model parameters")
+        for param in vla.parameters():
+            param.requires_grad = True
+        trainable_params = sum(p.numel() for p in vla.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in vla.parameters())
+        print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
 
     # FiLM setup
     if cfg.use_film:
         count_parameters(vla.vision_backbone, "vla.vision_backbone (original)")
         # Wrap vision backbone with FiLM wrapper
-        # Important: For this, must specify `vla.model.vision_backbone` instead of just `vla.vision_backbone`, since the
-        # latter would cause the new wrapped backbone to be saved as a new attribute of `vla` instead of overwriting the
-        # original one (due to the LoRA wrapper)
-        vla.model.vision_backbone = FiLMedPrismaticVisionBackbone(
-            vision_backbone=vla.model.vision_backbone,
-            llm_dim=vla.llm_dim,
-        )
+        # Handle both LoRA and non-LoRA cases
+        if cfg.use_lora:
+            # With LoRA: must specify `vla.model.vision_backbone` due to LoRA wrapper
+            vision_backbone_ref = vla.model.vision_backbone
+            vla.model.vision_backbone = FiLMedPrismaticVisionBackbone(
+                vision_backbone=vision_backbone_ref,
+                llm_dim=vla.llm_dim,
+            )
+            if cfg.resume:
+                state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
+                vla.model.vision_backbone.load_state_dict(state_dict)
+            vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
+        else:
+            # Without LoRA: can directly access `vla.vision_backbone`
+            vision_backbone_ref = vla.vision_backbone
+            vla.vision_backbone = FiLMedPrismaticVisionBackbone(
+                vision_backbone=vision_backbone_ref,
+                llm_dim=vla.llm_dim,
+            )
+            if cfg.resume:
+                state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
+                vla.vision_backbone.load_state_dict(state_dict)
+            vla.vision_backbone = vla.vision_backbone.to(device_id)
         count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
-        if cfg.resume:
-            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
-            vla.model.vision_backbone.load_state_dict(state_dict)
-        vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
 
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
@@ -1069,10 +1175,10 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
-            # Push Metrics to W&B (every wandb_log_freq gradient steps)
+            # Push Metrics to logging (every log_freq gradient steps)
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
-            if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
-                log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+            if distributed_state.is_main_process and log_step % cfg.log_freq == 0:
+                log_metrics(smoothened_metrics, "VLA Train", log_step, wandb_entity, tensorboard_writer)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
@@ -1081,15 +1187,14 @@ def finetune(cfg: FinetuneConfig) -> None:
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = current_lr
 
-            if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
+            if distributed_state.is_main_process and gradient_step_idx % cfg.log_freq == 0:
                 # Log the learning rate
                 # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
-                wandb.log(
-                    {
-                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
-                    },
-                    step=log_step,
-                )
+                current_lr = scheduler.get_last_lr()[0]
+                if wandb_entity is not None:
+                    wandb_entity.log({"VLA Train/Learning Rate": current_lr}, step=log_step)
+                if tensorboard_writer is not None:
+                    tensorboard_writer.add_scalar("VLA Train/Learning_Rate", current_lr, log_step)
 
             # Optimizer and LR scheduler step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
@@ -1128,6 +1233,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                     log_step=log_step,
                     distributed_state=distributed_state,
                     val_time_limit=cfg.val_time_limit,
+                    wandb_entity=wandb_entity,
+                    tensorboard_writer=tensorboard_writer,
                 )
                 # Set model back to training mode after validation
                 vla.train()
@@ -1136,6 +1243,12 @@ def finetune(cfg: FinetuneConfig) -> None:
             if log_step == cfg.max_steps:
                 print(f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
+
+    # Close TensorBoard writer if used
+    if tensorboard_writer is not None:
+        tensorboard_writer.close()
+        if distributed_state.is_main_process:
+            print(f"TensorBoard logs saved to: {tensorboard_log_dir}")
 
 
 if __name__ == "__main__":
